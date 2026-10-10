@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPROC - Processos Favoritos
 // @namespace    eproc-favoritos
-// @version      1.5
+// @version      1.6
 // @description  Central de acompanhamento de processos favoritos integrada ao EPROC
 // @updateURL    https://raw.githubusercontent.com/rsalvessap/Eproc-Favoritos/main/eproc-favoritos.user.js
 // @downloadURL  https://raw.githubusercontent.com/rsalvessap/Eproc-Favoritos/main/eproc-favoritos.user.js
@@ -59,7 +59,6 @@
             }));
         } catch (_) {}
     }
-    let _baseUrlCache = null;
     let _urlApiInterceptada = null; // URL real capturada do XHR do eproc
 
     // ==============================
@@ -824,65 +823,6 @@
         return params;
     }
 
-    // Detecta a URL base do eproc (ex: https://eproc.tjsp.jus.br/sg5/)
-    function detectarBaseUrl() {
-        if (_baseUrlCache) return _baseUrlCache;
-
-        // 1. Usar URL capturada da interceptação real (mais confiável)
-        if (_urlApiInterceptada) {
-            try {
-                const url = new URL(_urlApiInterceptada, location.href);
-                _baseUrlCache = url.origin + url.pathname.replace(/controlador[^/]*$/, '');
-                localStorage.setItem('eproc-fav-base-url', _baseUrlCache);
-                return _baseUrlCache;
-            } catch (_) {}
-        }
-
-        // 2. Usar cache do localStorage (persiste entre páginas)
-        const cached = localStorage.getItem('eproc-fav-base-url');
-        if (cached) {
-            _baseUrlCache = cached;
-            return _baseUrlCache;
-        }
-
-        // 3. Procurar links/forms que referenciam controlador.php
-        const el = document.querySelector(
-            'a[href*="controlador.php"], form[action*="controlador.php"], ' +
-            'a[href*="controlador_ajax.php"], script[src*="controlador"]'
-        );
-        if (el) {
-            const href = el.href || el.action || el.src || '';
-            if (href) {
-                try {
-                    const url = new URL(href, location.href);
-                    _baseUrlCache = url.origin + url.pathname.replace(/controlador[^/]*$/, '');
-                    localStorage.setItem('eproc-fav-base-url', _baseUrlCache);
-                    return _baseUrlCache;
-                } catch (_) {}
-            }
-        }
-
-        // 4. Extrair do pathname atual (ex: /sg5/controlador.php → /sg5/)
-        const ctrlMatch = location.pathname.match(/^(.*\/)controlador[^/]*$/);
-        if (ctrlMatch) {
-            _baseUrlCache = location.origin + ctrlMatch[1];
-            localStorage.setItem('eproc-fav-base-url', _baseUrlCache);
-            return _baseUrlCache;
-        }
-
-        // 5. Extrair primeiro segmento do path (ex: /sg5/ )
-        const segMatch = location.pathname.match(/^(\/[^/]+\/)/);
-        if (segMatch) {
-            _baseUrlCache = location.origin + segMatch[1];
-            localStorage.setItem('eproc-fav-base-url', _baseUrlCache);
-            return _baseUrlCache;
-        }
-
-        // 6. Fallback
-        _baseUrlCache = location.origin + '/';
-        return _baseUrlCache;
-    }
-
     // Abre um processo usando o form de pesquisa rápida do eproc (#formPesquisaRapida,
     // presente em todas as páginas). NUNCA montar uma URL de capa manualmente: o eproc
     // exige um `hash` assinado e, se ele estiver ausente/inválido, o servidor não apenas
@@ -1109,6 +1049,8 @@
     }
 
     async function obterProcesso(numero) {
+        // store.get(undefined) lança DataError em vez de devolver "não encontrado".
+        if (!numero) return undefined;
         return dbRequest(await dbTransaction('processos', 'readonly'), 'get', numero);
     }
 
@@ -1252,13 +1194,9 @@
                     const fullUrl = new URL(this._eprocFavUrl, location.href);
                     // Salvar URL completa (inclui hash se o eproc usar)
                     _urlApiInterceptada = fullUrl.href;
-                    const base = fullUrl.origin + fullUrl.pathname.replace(/controlador_ajax\.php.*$/, '');
-                    _baseUrlCache = base;
-                    localStorage.setItem('eproc-fav-base-url', base);
                     // Salvar URL completa para a sessão atual
                     sessionStorage.setItem('eproc-fav-api-full-url', fullUrl.href);
                     console.log('[EPROC-FAV] URL API capturada:', fullUrl.href);
-                    console.log('[EPROC-FAV] URL base:', base);
                 } catch (_) {}
 
                 const params = parsePostParams(body);
@@ -1316,19 +1254,106 @@
         );
     }
 
-    // Chamada direta à API do eproc
-    function executarConsultaAPI(parametros) {
-        return new Promise((resolve, reject) => {
-            // Prioridade: URL da sessão atual (interceptada) > URL construída
-            const sessionUrl = _urlApiInterceptada || sessionStorage.getItem('eproc-fav-api-full-url');
-            const base = detectarBaseUrl();
-            const url = sessionUrl || (base + 'controlador_ajax.php?acao_ajax=processos_consulta_por_nome_parte');
+    // ==============================
+    // URL DA API (com hash assinado)
+    // ==============================
+    // A URL da consulta por nome só funciona com o `hash` assinado da sessão atual.
+    // NUNCA montar essa URL à mão: sem hash o eproc devolve a tela de login (o antigo
+    // erro "Sessão expirada ou URL incorreta") e ainda encerra a sessão do usuário.
+    const RE_URL_API = /controlador_ajax\.php\?acao_ajax=processos_consulta_por_nome_parte[^"'\s<>\\]*/;
 
-            if (!sessionUrl) {
-                console.warn('[EPROC-FAV] Nenhuma URL interceptada. Usando URL construída:', url);
-                console.warn('[EPROC-FAV] Para melhor funcionamento, faça uma pesquisa por nome no eproc primeiro.');
+    function extrairUrlApi(html, baseHref) {
+        const m = (html || '').match(RE_URL_API);
+        if (!m || !m[0].includes('hash=')) return null;
+        try {
+            return new URL(m[0].replace(/&amp;/g, '&'), baseHref).href;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    // Busca a tela de consulta por nome através do link do próprio menu do eproc (que
+    // já vem com hash válido) e extrai dela a URL da API.
+    async function descobrirUrlApiPeloMenu() {
+        const link = [...document.querySelectorAll('a[href*="hash="]')]
+            .find(a => /acao=[^&]*nome[^&]*parte/i.test(a.getAttribute('href') || ''));
+        if (!link) return null;
+        try {
+            const resp = await fetch(link.href, { credentials: 'same-origin' });
+            if (!resp.ok) return null;
+            return extrairUrlApi(await resp.text(), link.href);
+        } catch (e) {
+            console.warn('[EPROC-FAV] Falha ao buscar a tela de consulta por nome:', e);
+            return null;
+        }
+    }
+
+    async function obterUrlApi() {
+        // 1. Capturada do XHR do eproc nesta página
+        if (_urlApiInterceptada) return _urlApiInterceptada;
+
+        // 2. Presente no HTML da página atual (tela de consulta por nome)
+        // 3. Presente na tela de consulta por nome, alcançada pelo link do menu
+        const url = extrairUrlApi(document.documentElement.innerHTML, location.href)
+                 || await descobrirUrlApiPeloMenu();
+        if (url) {
+            _urlApiInterceptada = url;
+            sessionStorage.setItem('eproc-fav-api-full-url', url);
+            return url;
+        }
+
+        // 4. Capturada em outra página desta mesma aba
+        return sessionStorage.getItem('eproc-fav-api-full-url');
+    }
+
+    function esquecerUrlApi() {
+        _urlApiInterceptada = null;
+        sessionStorage.removeItem('eproc-fav-api-full-url');
+    }
+
+    // Garante que todo resultado tenha `nr_processo`. A API pode devolver itens sem o
+    // número, e um único deles derrubava a lista inteira com "Failed to execute 'get'
+    // on 'IDBObjectStore': No key or key range specified".
+    function normalizarResultados(resultados) {
+        const lista = Array.isArray(resultados)
+            ? resultados
+            : (resultados && typeof resultados === 'object' ? Object.values(resultados) : []);
+        const validos = [];
+        let ignorados = 0;
+
+        for (const item of lista) {
+            let numero = null;
+            if (item && typeof item === 'object') {
+                numero = item.nr_processo;
+                if (!numero) {
+                    for (const valor of Object.values(item)) {
+                        numero = typeof valor === 'string' ? extrairNumeroProcesso(valor) : null;
+                        if (numero) break;
+                    }
+                }
             }
+            if (!numero) {
+                if (!ignorados) {
+                    console.warn('[EPROC-FAV] Resultado sem número de processo. Campos recebidos:',
+                        item && typeof item === 'object' ? Object.keys(item) : typeof item);
+                }
+                ignorados++;
+                continue;
+            }
+            validos.push(Array.isArray(item) ? { nr_processo: numero } : { ...item, nr_processo: numero });
+        }
 
+        return { resultados: validos, ignorados };
+    }
+
+    // Chamada direta à API do eproc
+    async function executarConsultaAPI(parametros) {
+        const url = await obterUrlApi();
+        if (!url) {
+            throw new Error('Não foi possível obter o endereço da consulta nesta sessão. Abra a tela de consulta por nome da parte no eproc, faça uma pesquisa qualquer e tente novamente.');
+        }
+
+        return new Promise((resolve, reject) => {
             console.log('[EPROC-FAV] Consultando API:', url, parametros);
 
             const xhr = new XMLHttpRequest();
@@ -1348,27 +1373,22 @@
                 // Detectar redirect para login (resposta é HTML em vez de JSON)
                 if (resposta.trimStart().startsWith('<') || resposta.includes('login') && resposta.includes('<form')) {
                     console.warn('[EPROC-FAV] Resposta é HTML (possível redirect para login):', resposta.substring(0, 300));
-                    // Limpar URL salva pois pode estar incorreta
-                    localStorage.removeItem('eproc-fav-api-url');
-                    localStorage.removeItem('eproc-fav-base-url');
-                    _baseUrlCache = null;
+                    // A URL guardada tem hash de outra sessão — descartar
+                    esquecerUrlApi();
                     reject(new Error('Sessão expirada ou URL incorreta. Faça login no eproc, execute uma pesquisa por nome, e tente novamente.'));
                     return;
                 }
                 try {
                     const json = JSON.parse(resposta);
                     if (json && json.resultados) {
-                        resolve(json);
+                        resolve(normalizarResultados(json.resultados));
                     } else {
                         console.warn('[EPROC-FAV] Resposta sem resultados:', resposta.substring(0, 200));
-                        resolve({ resultados: [] });
+                        resolve({ resultados: [], ignorados: 0 });
                     }
                 } catch (e) {
                     console.error('[EPROC-FAV] Resposta não é JSON:', resposta.substring(0, 200));
-                    // Limpar cache de URL se resposta não é JSON
-                    localStorage.removeItem('eproc-fav-api-url');
-                    localStorage.removeItem('eproc-fav-base-url');
-                    _baseUrlCache = null;
+                    esquecerUrlApi();
                     reject(new Error('Resposta inválida da API. Faça login no eproc, execute uma pesquisa por nome, e tente novamente.'));
                 }
             };
@@ -2374,10 +2394,13 @@
 
         try {
             const resultado = await executarConsultaAPI(consulta.parametros);
+            const aviso = resultado && resultado.ignorados
+                ? ` — ${resultado.ignorados} sem número de processo (não exibidos)`
+                : '';
             if (!resultado || !resultado.resultados || resultado.resultados.length === 0) {
-                body.innerHTML = '<div class="eproc-fav-empty">Nenhum resultado encontrado</div>';
+                body.innerHTML = `<div class="eproc-fav-empty">Nenhum resultado encontrado${aviso}</div>`;
             } else {
-                body.innerHTML = `<div style="font-size:11px;color:#888;margin-bottom:4px">${resultado.resultados.length} resultado(s) — clique ☆ para favoritar</div>`;
+                body.innerHTML = `<div style="font-size:11px;color:#888;margin-bottom:4px">${resultado.resultados.length} resultado(s) — clique ☆ para favoritar${aviso}</div>`;
                 const container = document.createElement('div');
                 container.style.cssText = 'max-height:400px;overflow-y:auto';
 
